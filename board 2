@@ -1,0 +1,598 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// DFPlayer New Safe Pins: RX = D7 (GPIO 13), TX = D8 (GPIO 15)
+SoftwareSerial mySoftwareSerial(13, 15); 
+DFRobotDFPlayerMini myDFPlayer;
+bool dfPlayerReady = false;
+
+// Home Wi-Fi Credentials
+const char *ssid = "Vikings";
+const char *password = "Bogurardoi100100";
+
+ESP8266WebServer server(80);
+
+// Global State Variables
+String currentMood = "normal";
+bool autoMode = false;
+unsigned long lastAutoMove = 0;
+unsigned long lastAnimTick = 0;
+
+// Dynamic LERP & Physics Variables
+float leftX_curr = 22, leftY_curr = 14, leftW_curr = 34, leftH_curr = 36;
+float rightX_curr = 72, rightY_curr = 14, rightW_curr = 34, rightH_curr = 36;
+
+float leftX_target = 22, leftY_target = 14, leftW_target = 34, leftH_target = 36;
+float rightX_target = 72, rightY_target = 14, rightW_target = 34, rightH_target = 36;
+
+int animTick = 0;
+int spinAngle = 0;
+int tearY = 0;
+int zzzY = 0;
+int clockMins = 0;
+int clockSecs = 0;
+
+float joyOffsetX = 0;
+float joyOffsetY = 0;
+
+void playSoundTrack(int trackNumber) {
+  if (dfPlayerReady && trackNumber > 0) {
+    myDFPlayer.play(trackNumber);
+  }
+}
+
+String encodeBase64(const uint8_t* buf, size_t bufLen) {
+  static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String out = "";
+  out.reserve((bufLen * 4 / 3) + 4);
+  for (size_t i = 0; i < bufLen; i += 3) {
+    uint32_t b = (buf[i] << 16) | ((i + 1 < bufLen ? buf[i + 1] : 0) << 8) | (i + 2 < bufLen ? buf[i + 2] : 0);
+    out += b64[(b >> 18) & 0x3F];
+    out += b64[(b >> 12) & 0x3F];
+    out += (i + 1 < bufLen) ? b64[(b >> 6) & 0x3F] : '=';
+    out += (i + 2 < bufLen) ? b64[b & 0x3F] : '=';
+  }
+  return out;
+}
+
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EMO Master Control Center</title>
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0d1117; color: #c9d1d9; margin: 0; padding: 15px; text-align: center; }
+    .card { background: #161b22; padding: 20px; border-radius: 16px; max-width: 460px; margin: 0 auto; box-shadow: 0 4px 20px rgba(0,0,0,0.6); border: 1px solid #30363d; }
+    h2 { color: #58a6ff; margin-top: 0; margin-bottom: 10px; }
+    .screen-container { background: #000; border: 3px solid #30363d; border-radius: 10px; padding: 6px; display: inline-block; margin: 5px 0 15px 0; box-shadow: 0 0 15px rgba(88,166,255,0.2); }
+    canvas { background: #000; image-rendering: pixelated; display: block; border-radius: 4px; }
+    .joystick-wrapper { margin: 15px auto; width: 130px; height: 130px; background: #21262d; border: 2px solid #30363d; border-radius: 50%; position: relative; touch-action: none; display: flex; align-items: center; justify-content: center; }
+    .joystick-knob { width: 45px; height: 45px; background: #58a6ff; border-radius: 50%; position: absolute; box-shadow: 0 0 10px rgba(88,166,255,0.5); cursor: pointer; transition: background 0.2s; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #fff; font-weight: bold; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 15px; }
+    .btn { padding: 10px; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; color: white; transition: 0.2s; font-size: 12px; background: #21262d; border: 1px solid #30363d; }
+    .btn:hover { background: #30363d; border-color: #8b949e; }
+    .btn-active { background: #238636 !important; border-color: #2ea043 !important; }
+    .btn-auto { background: #8957e5 !important; border-color: #a371f7 !important; }
+    .btn-voice { background: #238636 !important; border-color: #2ea043 !important; }
+    .btn-danger { background: #da3633 !important; }
+    .btn-love { background: #e91e63 !important; }
+    .btn-sleep { background: #1f6feb !important; }
+    .btn-hand { background: #d97706 !important; }
+    .btn-special { background: #0284c7 !important; }
+    .full-width { grid-column: span 2; }
+    #voiceStatus { margin-top: 8px; font-size: 12px; color: #58a6ff; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🤖 Master EMO Desk Bot</h2>
+    <div class="screen-container">
+      <canvas id="liveCanvas" width="128" height="64" style="width: 256px; height: 128px;"></canvas>
+    </div>
+
+    <div style="font-size: 11px; color: #8b949e; margin-bottom: 2px;">🎮 Drag Joystick to Move Eyes</div>
+    <div class="joystick-wrapper" id="joyContainer">
+      <div class="joystick-knob" id="joyKnob" onclick="resetJoystickCenter()">⦿</div>
+    </div>
+
+    <button id="voiceBtn" class="btn btn-voice full-width" onclick="toggleVoice()">🎙️ Start Voice Listener</button>
+    <div id="voiceStatus">Say "Hey EMO" or "Curious", "Petting", "Clock", "Shy"</div>
+
+    <button id="autoBtn" class="btn btn-auto full-width" style="margin-top: 8px;" onclick="toggleAuto()">🔄 Enable Auto Mode</button>
+
+    <div class="grid">
+      <button class="btn mood-btn btn-special" onclick="setMood('petting', this, 5)">🐾 Petting React (S5)</button>
+      <button class="btn mood-btn btn-special" onclick="setMood('clock', this, 0)">⏰ Clock Companion</button>
+      <button class="btn mood-btn btn-special" onclick="setMood('charging', this, 0)">⚡ Battery Charging</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('listening', this, 0)">👂 Listening Radar</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('squint', this, 0)">😊 Squint Smile</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('confused_q', this, 0)">❓ Confused (?)</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('shock_excl', this, 0)">❗ Shocked (!)</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('spiral', this, 0)">🌀 Hypno Spiral</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('dizzy_cross', this, 0)">❌ Cross Dizzy</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('curious', this, 0)">🧐 Curious Tilt</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('wave', this, 0)">👋 Cute Wave</button>
+      <button class="btn mood-btn btn-hand" onclick="setMood('shy', this, 0)">🫣 Shy Blushing</button>
+      <button class="btn btn-active mood-btn" onclick="setMood('normal', this, 0)">🙂 Organic Idle</button>
+      <button class="btn mood-btn btn-love" onclick="setMood('love', this, 2)">❤️ Heartbeat (S2)</button>
+      <button class="btn mood-btn" onclick="setMood('thinking', this, 0)">🌀 Thinking Orbit</button>
+      <button class="btn mood-btn" onclick="setMood('wink', this, 0)">😉 Cute Wink</button>
+      <button class="btn mood-btn" onclick="setMood('crying', this, 0)">💧 Waterfall Tears</button>
+      <button class="btn mood-btn" onclick="setMood('happy', this, 1)">😄 Joy Bounce (S1)</button>
+      <button class="btn mood-btn" onclick="setMood('sad', this, 0)">🥺 Sad Droop</button>
+      <button class="btn mood-btn btn-danger" onclick="setMood('angry', this, 3)">😡 Angry Pulse (S3)</button>
+      <button class="btn mood-btn" onclick="setMood('surprised', this, 0)">😮 Shocked Pupil</button>
+      <button class="btn mood-btn" onclick="setMood('sleep', this, 0)">😴 Static Nap</button>
+      <button class="btn mood-btn btn-sleep full-width" onclick="setMood('sleep_zzz', this, 4)">💤 Deep ZZZ Sleep (S4)</button>
+    </div>
+  </div>
+
+  <script>
+    let isAuto = false;
+    let isListening = false;
+    let recognition = null;
+    const canvas = document.getElementById('liveCanvas');
+    const ctx = canvas.getContext('2d');
+
+    function setMood(mood, elem, sound = 0) {
+      if(isAuto) toggleAuto(); 
+      document.querySelectorAll('.mood-btn').forEach(b => b.classList.remove('btn-active'));
+      if(elem) elem.classList.add('btn-active');
+      fetch(`/setMood?type=${mood}&sound=${sound}`);
+    }
+
+    function toggleAuto() {
+      isAuto = !isAuto;
+      const btn = document.getElementById('autoBtn');
+      btn.innerText = isAuto ? "⏸️ Stop Auto Mode" : "🔄 Enable Auto Mode";
+      btn.style.background = isAuto ? "#da3633" : "#8957e5";
+      fetch(`/toggleAuto?state=${isAuto ? 1 : 0}`);
+    }
+
+    const joyContainer = document.getElementById('joyContainer');
+    const joyKnob = document.getElementById('joyKnob');
+    let isDragging = false;
+    let lastSendTime = 0;
+
+    function handleJoystickMove(evt) {
+      if (!isDragging) return;
+      const rect = joyContainer.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      let clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+      let clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+
+      let deltaX = clientX - centerX;
+      let deltaY = clientY - centerY;
+      const maxRadius = 40;
+
+      const distance = Math.hypot(deltaX, deltaY);
+      if (distance > maxRadius) {
+        deltaX = (deltaX / distance) * maxRadius;
+        deltaY = (deltaY / distance) * maxRadius;
+      }
+
+      joyKnob.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+      let offsetX = (deltaX / maxRadius) * 14;
+      let offsetY = (deltaY / maxRadius) * 10;
+
+      if (Date.now() - lastSendTime > 60) {
+        fetch(`/joyMove?x=${offsetX.toFixed(1)}&y=${offsetY.toFixed(1)}`);
+        lastSendTime = Date.now();
+      }
+    }
+
+    function resetJoystickCenter() {
+      isDragging = false;
+      joyKnob.style.transform = `translate(0px, 0px)`;
+      setMood('normal', document.querySelector("button[onclick*='normal']"), 0);
+    }
+
+    joyContainer.addEventListener('mousedown', (e) => { isDragging = true; handleJoystickMove(e); });
+    window.addEventListener('mousemove', handleJoystickMove);
+    window.addEventListener('mouseup', resetJoystickCenter);
+    joyContainer.addEventListener('touchstart', (e) => { isDragging = true; handleJoystickMove(e); });
+    window.addEventListener('touchmove', handleJoystickMove);
+    window.addEventListener('touchend', resetJoystickCenter);
+
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = function(event) {
+        const lastIdx = event.results.length - 1;
+        let rawText = event.results[lastIdx][0].transcript.trim().toLowerCase();
+        let text = rawText.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, ""); 
+        document.getElementById('voiceStatus').innerText = 'Heard: "' + text + '"';
+        const isWakeWord = /(hey|hi|hello|ok|okay)?\s*(emo|imo|emu|elmo|emma|email|imoa)\b/i.test(text);
+
+        if (isWakeWord) {
+          document.getElementById('voiceStatus').innerText = '🤖 "Hey EMO" Activated!';
+          setMood('surprised', document.querySelector("button[onclick*='surprised']"), 0);
+          setTimeout(() => {
+            setMood('happy', document.querySelector("button[onclick*='happy']"), 1);
+            setTimeout(() => {
+              if (isListening) setMood('listening', document.querySelector("button[onclick*='listening']"), 0);
+            }, 1500);
+          }, 1200);
+        } 
+        else if (text.includes("clock")) setMood('clock', document.querySelector("button[onclick*='clock']"), 0);
+        else if (text.includes("pet") || text.includes("cute")) setMood('petting', document.querySelector("button[onclick*='petting']"), 5);
+        else if (text.includes("charge")) setMood('charging', document.querySelector("button[onclick*='charging']"), 0);
+        else if (text.includes("angry")) setMood('angry', document.querySelector("button[onclick*='angry']"), 3);
+        else if (text.includes("love")) setMood('love', document.querySelector("button[onclick*='love']"), 2);
+        else if (text.includes("sleep")) setMood('sleep_zzz', document.querySelector("button[onclick*='sleep_zzz']"), 4);
+      };
+
+      recognition.onend = function() { if (isListening) recognition.start(); };
+    }
+
+    function toggleVoice() {
+      if (!recognition) return;
+      isListening = !isListening;
+      const btn = document.getElementById('voiceBtn');
+      if (isListening) {
+        recognition.start();
+        btn.innerText = "🛑 Stop Voice Listener";
+        btn.style.background = "#da3633";
+        setMood('listening', document.querySelector("button[onclick*='listening']"), 0);
+      } else {
+        recognition.stop();
+        btn.innerText = "🎙️ Start Voice Listener";
+        btn.style.background = "#238636";
+        setMood('normal', document.querySelector("button[onclick*='normal']"), 0);
+      }
+    }
+
+    function fetchLiveFrame() {
+      fetch('/getFrame')
+        .then(res => res.text())
+        .then(base64 => {
+          if(!base64) return;
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+          ctx.fillStyle = "black";
+          ctx.fillRect(0, 0, 128, 64);
+          ctx.fillStyle = "#58a6ff";
+
+          for (let page = 0; page < 8; page++) {
+            for (let x = 0; x < 128; x++) {
+              let byteVal = bytes[page * 128 + x];
+              for (let bit = 0; bit < 8; bit++) {
+                if (byteVal & (1 << bit)) {
+                  let y = page * 8 + bit;
+                  ctx.fillRect(x, y, 1, 1);
+                }
+              }
+            }
+          }
+        })
+        .catch(err => {})
+        .finally(() => setTimeout(fetchLiveFrame, 100));
+    }
+    fetchLiveFrame();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+float lerp(float start, float end, float amt) { return start + amt * (end - start); }
+
+void setTarget(float lx, float ly, float lw, float lh, float rx, float ry, float rw, float rh) {
+  leftX_target = lx; leftY_target = ly; leftW_target = lw; leftH_target = lh;
+  rightX_target = rx; rightY_target = ry; rightW_target = rw; rightH_target = rh;
+}
+
+void updatePhysicsTargets() {
+  if (currentMood == "joystick") {
+    setTarget(22 + joyOffsetX, 14 + joyOffsetY, 34, 36, 72 + joyOffsetX, 14 + joyOffsetY, 34, 36);
+  } else if (currentMood == "normal") {
+    int glance = (animTick % 20 < 10) ? 1 : 0;
+    setTarget(22, 14 + glance, 34, 36 - glance, 72, 14 + glance, 34, 36 - glance);
+  } else if (currentMood == "petting") {
+    int squish = (animTick % 4 < 2) ? 2 : 0;
+    setTarget(22, 18 + squish, 34, 28, 72, 18 + squish, 34, 28);
+  } else if (currentMood == "squint") {
+    setTarget(22, 20, 34, 20, 72, 20, 34, 20);
+  } else if (currentMood == "listening") {
+    setTarget(22, 10, 34, 38, 72, 10, 34, 38);
+  } else if (currentMood == "curious") {
+    setTarget(20, 18, 34, 34, 72, 10, 36, 38);
+  } else if (currentMood == "wave") {
+    int shift = (animTick % 3);
+    setTarget(30 + shift, 14, 34, 36, 80 + shift, 28, 34, 8);
+  } else if (currentMood == "shy") {
+    setTarget(22, 22, 34, 24, 72, 22, 34, 24);
+  } else if (currentMood == "wink") {
+    int offset = (animTick % 2);
+    setTarget(22, 14 + offset, 34, 36, 72, 30 + offset, 34, 8);
+  } else if (currentMood == "crying") {
+    setTarget(22, 18, 34, 30, 72, 18, 34, 30);
+  } else if (currentMood == "blink") {
+    setTarget(22, 32, 34, 6, 72, 32, 34, 6);
+  } else if (currentMood == "happy") {
+    int b = (animTick % 3);
+    setTarget(22, 14 - b, 34, 36, 72, 14 - b, 34, 36);
+  } else if (currentMood == "sad") {
+    setTarget(22, 20, 34, 30, 72, 20, 34, 30);
+  } else if (currentMood == "angry") {
+    setTarget(22, 18, 34, 32, 72, 18, 34, 32);
+  } else if (currentMood == "sleep") {
+    setTarget(22, 35, 34, 4, 72, 35, 34, 4);
+  } else if (currentMood == "sleep_zzz") {
+    int breath = (animTick % 2);
+    setTarget(18, 38 + breath, 34, 4, 64, 38 + breath, 34, 4);
+  }
+}
+
+void drawHeart(int cx, int cy, int size) {
+  display.fillCircle(cx - (size/2), cy - (size/3), size/2, SSD1306_WHITE);
+  display.fillCircle(cx + (size/2), cy - (size/3), size/2, SSD1306_WHITE);
+  display.fillTriangle(cx - size, cy - (size/6), cx + size, cy - (size/6), cx, cy + size, SSD1306_WHITE);
+}
+
+void renderEyes() {
+  animTick++;
+  updatePhysicsTargets();
+
+  leftX_curr = lerp(leftX_curr, leftX_target, 0.25);
+  leftY_curr = lerp(leftY_curr, leftY_target, 0.25);
+  leftW_curr = lerp(leftW_curr, leftW_target, 0.25);
+  leftH_curr = lerp(leftH_curr, leftH_target, 0.25);
+
+  rightX_curr = lerp(rightX_curr, rightX_target, 0.25);
+  rightY_curr = lerp(rightY_curr, rightY_target, 0.25);
+  rightW_curr = lerp(rightW_curr, rightW_target, 0.25);
+  rightH_curr = lerp(rightH_curr, rightH_target, 0.25);
+
+  display.clearDisplay();
+
+  if (currentMood == "clock") {
+    clockSecs++;
+    if (clockSecs >= 30) { clockMins = (clockMins + 1) % 60; clockSecs = 0; }
+    display.fillRoundRect(26, 6, 20, 16, 6, SSD1306_WHITE);
+    display.fillRoundRect(82, 6, 20, 16, 6, SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(32, 34);
+    if (clockMins < 10) display.print("10:0");
+    else display.print("10:");
+    display.print(clockMins);
+  } 
+  else if (currentMood == "charging") {
+    display.fillRoundRect(22, 16, 34, 34, 12, SSD1306_WHITE);
+    display.fillRoundRect(72, 16, 34, 34, 12, SSD1306_WHITE);
+    display.fillTriangle(64, 10, 56, 32, 66, 32, SSD1306_WHITE);
+    display.fillTriangle(66, 32, 62, 54, 72, 28, SSD1306_WHITE);
+  }
+  else if (currentMood == "spiral") {
+    spinAngle = (spinAngle + 30) % 360;
+    int r = 16;
+    display.drawCircle(38, 32, r, SSD1306_WHITE);
+    display.drawCircle(38, 32, r - 6, SSD1306_WHITE);
+    display.drawCircle(90, 32, r, SSD1306_WHITE);
+    display.drawCircle(90, 32, r - 6, SSD1306_WHITE);
+    float rad = spinAngle * 0.0174533;
+    display.fillCircle(38 + cos(rad) * (r - 3), 32 + sin(rad) * (r - 3), 3, SSD1306_WHITE);
+    display.fillCircle(90 + cos(rad) * (r - 3), 32 + sin(rad) * (r - 3), 3, SSD1306_WHITE);
+  }
+  else if (currentMood == "dizzy_cross") {
+    int quake = (animTick % 2);
+    display.drawLine(25, 20 + quake, 50, 45 + quake, SSD1306_WHITE);
+    display.drawLine(25, 45 + quake, 50, 20 + quake, SSD1306_WHITE);
+    display.drawLine(77, 20 + quake, 102, 45 + quake, SSD1306_WHITE);
+    display.drawLine(77, 45 + quake, 102, 20 + quake, SSD1306_WHITE);
+  }
+  else if (currentMood == "confused_q") {
+    display.fillRoundRect(20, 20, 34, 28, 10, SSD1306_WHITE);
+    display.fillRoundRect(72, 12, 36, 40, 10, SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(58, 4 + (animTick % 2));
+    display.print("?");
+  }
+  else if (currentMood == "shock_excl") {
+    display.fillCircle(38, 32, 18, SSD1306_WHITE);
+    display.fillCircle(90, 32, 18, SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(60, 2);
+    display.print("!");
+  }
+  else if (currentMood == "love") {
+    int p = (animTick % 6);
+    int pulse = (p == 1 || p == 3) ? 3 : 0;
+    drawHeart(38, 32, 12 + pulse);
+    drawHeart(90, 32, 12 + pulse);
+  } 
+  else if (currentMood == "thinking") {
+    spinAngle = (spinAngle + 30) % 360;
+    int r = 14;
+    display.drawCircle(38, 32, r, SSD1306_WHITE);
+    display.drawCircle(90, 32, r, SSD1306_WHITE);
+    float rad = spinAngle * 0.0174533;
+    display.fillCircle(38 + cos(rad) * r, 32 + sin(rad) * r, 4, SSD1306_WHITE);
+    display.fillCircle(90 + cos(rad) * r, 32 + sin(rad) * r, 4, SSD1306_WHITE);
+  } 
+  else {
+    display.fillRoundRect((int)leftX_curr, (int)leftY_curr, (int)leftW_curr, (int)leftH_curr, 14, SSD1306_WHITE);
+    display.fillRoundRect((int)rightX_curr, (int)rightY_curr, (int)rightW_curr, (int)rightH_curr, 14, SSD1306_WHITE);
+
+    if (currentMood == "squint") {
+      display.fillRect(15, 14, 100, 10, SSD1306_BLACK);
+    } else if (currentMood == "petting") {
+      display.fillCircle(20, 52, 2, SSD1306_WHITE);
+      display.fillCircle(108, 52, 2, SSD1306_WHITE);
+    } else if (currentMood == "listening") {
+      int waveR = (animTick % 3) * 3;
+      display.drawCircle(39, 29, 20 + waveR, SSD1306_WHITE);
+      display.drawCircle(89, 29, 20 + waveR, SSD1306_WHITE);
+    } else if (currentMood == "crying") {
+      display.fillTriangle(15, 12, 60, 12, 15, 26, SSD1306_BLACK);
+      display.fillTriangle(68, 12, 113, 12, 113, 26, SSD1306_BLACK);
+      tearY = (tearY + 3) % 24;
+      display.fillCircle(38, 44 + tearY, 2, SSD1306_WHITE);
+      display.fillCircle(90, 44 + tearY, 2, SSD1306_WHITE);
+    } else if (currentMood == "happy") {
+      int b = (animTick % 3);
+      display.fillRect(15, 32 - b, 46, 22, SSD1306_BLACK);
+      display.fillRect(67, 32 - b, 46, 22, SSD1306_BLACK);
+    } else if (currentMood == "sad") {
+      display.fillTriangle(15, 12, 60, 12, 15, 26, SSD1306_BLACK);
+      display.fillTriangle(68, 12, 113, 12, 113, 26, SSD1306_BLACK);
+    } else if (currentMood == "angry") {
+      display.fillTriangle(20, 12, 60, 12, 60, 26, SSD1306_BLACK);
+      display.fillTriangle(68, 12, 108, 12, 68, 26, SSD1306_BLACK);
+    } else if (currentMood == "shy") {
+      display.fillCircle(18, 52, 2, SSD1306_WHITE);
+      display.fillCircle(24, 54, 2, SSD1306_WHITE);
+      display.fillCircle(110, 52, 2, SSD1306_WHITE);
+      display.fillCircle(104, 54, 2, SSD1306_WHITE);
+    } else if (currentMood == "sleep_zzz") {
+      zzzY = (zzzY + 1) % 28;
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(102, 30 - zzzY); display.print("Z");
+      if (zzzY > 8) { display.setCursor(108, 40 - zzzY); display.print("z"); }
+      if (zzzY > 16) { display.setCursor(114, 50 - zzzY); display.print("z"); }
+    }
+  }
+
+  display.display();
+}
+
+void performSmoothBlink() {
+  String prev = currentMood;
+  currentMood = "blink";
+  for(int i = 0; i < 5; i++) { renderEyes(); delay(20); }
+  currentMood = prev;
+  for(int i = 0; i < 5; i++) { renderEyes(); delay(20); }
+}
+
+void handleRoot() { server.send(200, "text/html; charset=utf-8", HTML_PAGE); }
+
+void handleSetMood() {
+  if (server.hasArg("type")) {
+    currentMood = server.arg("type");
+    autoMode = false;
+  }
+  if (server.hasArg("sound")) {
+    int snd = server.arg("sound").toInt();
+    if (snd > 0) playSoundTrack(snd);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleJoyMove() {
+  if (server.hasArg("x") && server.hasArg("y")) {
+    joyOffsetX = server.arg("x").toFloat();
+    joyOffsetY = server.arg("y").toFloat();
+    currentMood = "joystick";
+    autoMode = false;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleToggleAuto() {
+  if (server.hasArg("state")) {
+    autoMode = (server.arg("state").toInt() == 1);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleGetFrame() {
+  uint8_t* buffer = display.getBuffer();
+  String base64Data = encodeBase64(buffer, 1024);
+  server.send(200, "text/plain", base64Data);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize Display
+  Wire.begin(4, 5); // SDA = D2, SCL = D1
+  Wire.setClock(400000); 
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    for(;;);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20); display.println("Connecting WiFi...");
+  display.setCursor(10, 35); display.println(ssid);
+  display.display();
+
+  // WiFi Connection
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+
+  display.clearDisplay();
+  display.setCursor(10, 15); display.println("Connected!");
+  display.setCursor(10, 35); display.println(WiFi.localIP());
+  display.display();
+  delay(2000);
+
+  // Initialize DFPlayer safely on D7, D8
+  mySoftwareSerial.begin(9600);
+  if (myDFPlayer.begin(mySoftwareSerial)) {
+    dfPlayerReady = true;
+    myDFPlayer.volume(22);
+  }
+
+  if (MDNS.begin("emo")) { Serial.println("mDNS started: http://emo.local"); }
+
+  renderEyes();
+
+  server.on("/", handleRoot);
+  server.on("/setMood", handleSetMood);
+  server.on("/joyMove", handleJoyMove);
+  server.on("/toggleAuto", handleToggleAuto);
+  server.on("/getFrame", handleGetFrame);
+  server.begin();
+}
+
+const char* autoMoods[] = {"normal", "petting", "curious", "wave", "shy", "happy", "love", "confused_q", "thinking", "sleep_zzz"};
+
+void loop() {
+  server.handleClient();
+  MDNS.update();
+  yield();
+
+  if (millis() - lastAnimTick > 30) {
+    renderEyes();
+    lastAnimTick = millis();
+  }
+
+  if (autoMode) {
+    if (millis() - lastAutoMove > 3500) {
+      int randomIndex = random(0, 10);
+      currentMood = autoMoods[randomIndex];
+      performSmoothBlink();
+      lastAutoMove = millis();
+    }
+  }
+}
